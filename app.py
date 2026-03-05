@@ -33,18 +33,15 @@ if st.button("데이터 수집 시작"):
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-gpu")
-        
-        # [핵심] 서버 환경에서 크롬 위치를 자동으로 찾는 설정
-        options.binary_location = "/usr/bin/chromium" 
-        service = Service("/usr/bin/chromedriver")
-        
+        # 사용자 에이전트 설정 (차단 방지)
+        options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+
         try:
-            driver = webdriver.Chrome(service=service, options=options)
+            # 경로를 직접 지정하지 않고 시스템 설치본을 사용하도록 변경
+            driver = webdriver.Chrome(options=options)
         except Exception as e:
-            # 위 경로가 실패할 경우를 대비한 2차 경로 (OS 버전에 따라 다를 수 있음)
-            options.binary_location = "/usr/bin/chromium-browser"
-            service = Service("/usr/bin/chromium-browser.chromedriver")
-            driver = webdriver.Chrome(service=service, options=options)
+            st.error(f"드라이버 초기화 실패: {str(e)}")
+            st.stop()
 
             # 스크롤 로직
             last_height = driver.execute_script("return document.body.scrollHeight")
