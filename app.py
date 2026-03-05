@@ -18,8 +18,8 @@ from openpyxl.styles import Alignment, Font
 import datetime
 
 # 페이지 설정
-st.set_page_config(page_title="범용 쇼핑몰 크롤러", layout="wide")
-st.title("🛒 범용 쇼핑몰 상품 크롤러")
+st.set_page_config(page_title="VL&CO 상품 크롤러", layout="wide")
+st.title("🛒 VL&CO 상품 크롤러")
 
 target_url = st.text_input("크롤링할 사이트 주소를 입력하세요", value="https://www.thenorthfacekorea.co.kr/category/n/whitelabel/womens?page=3")
 
