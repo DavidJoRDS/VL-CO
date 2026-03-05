@@ -18,8 +18,16 @@ from openpyxl.styles import Alignment, Font
 import datetime
 
 # 페이지 설정
-st.set_page_config(page_title="VL&CO 상품 크롤러", layout="wide")
-st.title("🛒 VL&CO 상품 크롤러")
+st.set_page_config(page_title="범용 쇼핑몰 크롤러", layout="wide")
+st.title("🛒 범용 쇼핑몰 상품 크롤러")
+
+# 세션 상태 초기화 (수집된 데이터를 보관하는 저장소)
+if 'excel_data' not in st.session_state:
+    st.session_state.excel_data = None
+if 'zip_data' not in st.session_state:
+    st.session_state.zip_data = None
+if 'result_count' not in st.session_state:
+    st.session_state.result_count = 0
 
 target_url = st.text_input("크롤링할 사이트 주소를 입력하세요", value="https://www.thenorthfacekorea.co.kr/category/n/whitelabel/womens?page=3")
 
@@ -27,9 +35,13 @@ def clean_filename(filename):
     """파일명으로 사용할 수 없는 특수문자 제거"""
     return re.sub(r'[\\/*?:"<>|]', "", filename)
 
+# 데이터 수집 시작 버튼
 if st.button("🚀 데이터 수집 시작"):
-    with st.spinner('서버 인스턴스를 초기화하고 상품 정보를 수집 중입니다...'):
-        # 이미지 저장 폴더 초기화
+    # 새로운 수집 시작 시 이전 기록 초기화
+    st.session_state.excel_data = None
+    st.session_state.zip_data = None
+    
+    with st.spinner('상품 정보를 수집 중입니다. 잠시만 기다려 주세요...'):
         IMG_FOLDER = "collected_images"
         if os.path.exists(IMG_FOLDER):
             shutil.rmtree(IMG_FOLDER)
@@ -47,14 +59,13 @@ if st.button("🚀 데이터 수집 시작"):
             driver.get(target_url)
             time.sleep(5)
 
-            # 스크롤 로직 (기존 유지)
+            # 스크롤 로직
             last_height = driver.execute_script("return document.body.scrollHeight")
             while True:
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
                 time.sleep(2)
                 new_height = driver.execute_script("return document.body.scrollHeight")
-                if new_height == last_height:
-                    break
+                if new_height == last_height: break
                 last_height = new_height
 
             # 상품 탐색
@@ -88,13 +99,7 @@ if st.button("🚀 데이터 수집 시작"):
                         if len(img_urls) >= 2: break
 
                     if img_urls:
-                        final_results.append({
-                            "제품명": product_name, 
-                            "정가": reg_price, 
-                            "세일가": sale_price, 
-                            "링크": link, 
-                            "이미지들": img_urls
-                        })
+                        final_results.append({"제품명": product_name, "정가": reg_price, "세일가": sale_price, "링크": link, "이미지들": img_urls})
                         seen_links.add(link)
                 except: continue
 
@@ -124,67 +129,62 @@ if st.button("🚀 데이터 수집 시작"):
                     l_cell = ws.cell(row=row_idx, column=7, value="링크")
                     l_cell.hyperlink = data["링크"]
 
-                    # 이미지 다운로드 및 저장
                     safe_name = clean_filename(data["제품명"])
                     for j, img_url in enumerate(data["이미지들"]):
                         try:
                             res = requests.get(img_url, timeout=5)
                             img_pil = PILImage.open(BytesIO(res.content)).convert("RGB")
                             
-                            # 1. 엑셀 삽입용 썸네일 저장
                             img_thumb = img_pil.copy()
                             img_thumb.thumbnail((200, 200))
                             thumb_path = os.path.join(IMG_FOLDER, f"thumb_{row_idx}_{j}.png")
                             img_thumb.save(thumb_path)
                             ws.add_image(XLImage(thumb_path), f"{'C' if j==0 else 'D'}{row_idx}")
                             
-                            # 2. 개별 이미지 파일 저장 (파일명: 제품명_번호.jpg)
                             final_img_name = f"{i}_{safe_name}_{j+1}.jpg"
                             img_pil.save(os.path.join(IMG_FOLDER, final_img_name), "JPEG", quality=90)
                         except: continue
 
-                # 엑셀 파일 메모리에 저장
-                excel_data = BytesIO()
-                wb.save(excel_data)
-                excel_data.seek(0)
+                # 데이터를 세션 상태에 저장
+                excel_io = BytesIO()
+                wb.save(excel_io)
+                st.session_state.excel_data = excel_io.getvalue()
 
-                # 이미지 폴더를 ZIP으로 압축
-                zip_buffer = BytesIO()
-                with zipfile.ZipFile(zip_buffer, "w") as zf:
+                zip_io = BytesIO()
+                with zipfile.ZipFile(zip_io, "w") as zf:
                     for root, dirs, files in os.walk(IMG_FOLDER):
                         for file in files:
-                            # 썸네일용 임시 파일은 제외하고 실제 저장용 이미지만 압축
                             if not file.startswith("thumb_"):
                                 zf.write(os.path.join(root, file), file)
-                zip_buffer.seek(0)
+                st.session_state.zip_data = zip_io.getvalue()
+                st.session_state.result_count = len(final_results)
 
-                st.success(f"✅ {len(final_results)}개의 상품 수집 완료!")
-
-                # 다운로드 버튼 가로 배치
-                col1, col2 = st.columns(2)
-                timestamp = datetime.datetime.now().strftime('%H%M%S')
-                with col1:
-                    st.download_button(
-                        label="📥 엑셀 파일 다운로드",
-                        data=excel_data,
-                        file_name=f"result_{timestamp}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
-                with col2:
-                    st.download_button(
-                        label="🖼️ 이미지 모음(.zip) 다운로드",
-                        data=zip_buffer,
-                        file_name=f"images_{timestamp}.zip",
-                        mime="application/zip"
-                    )
-                
-                # 서버 메모리 정리를 위해 임시 폴더 삭제
                 shutil.rmtree(IMG_FOLDER)
-
             else:
-                st.warning("상품을 찾지 못했습니다. 사이트 구조가 다르거나 로딩이 덜 되었을 수 있습니다.")
+                st.warning("상품을 찾지 못했습니다.")
 
         except Exception as e:
             st.error(f"❌ 오류 발생: {str(e)}")
         finally:
             if 'driver' in locals(): driver.quit()
+
+# 수집 결과가 세션에 있다면 버튼을 화면에 유지함
+if st.session_state.excel_data and st.session_state.zip_data:
+    st.success(f"✅ 총 {st.session_state.result_count}개의 상품이 준비되었습니다!")
+    col1, col2 = st.columns(2)
+    timestamp = datetime.datetime.now().strftime('%H%M%S')
+    
+    with col1:
+        st.download_button(
+            label="📥 엑셀 파일 다운로드",
+            data=st.session_state.excel_data,
+            file_name=f"result_{timestamp}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    with col2:
+        st.download_button(
+            label="🖼️ 이미지 모음(.zip) 다운로드",
+            data=st.session_state.zip_data,
+            file_name=f"images_{timestamp}.zip",
+            mime="application/zip"
+        )
