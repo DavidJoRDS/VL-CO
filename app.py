@@ -29,19 +29,22 @@ if st.button("데이터 수집 시작"):
             os.makedirs("img")
 
         options = Options()
-        options.add_argument("--headless") 
+        options.add_argument("--headless")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-gpu") # 추가
-        options.binary_location = "/usr/bin/chromium-browser" # 서버 내 크롬 위치 강제 지정
+        options.add_argument("--disable-gpu")
         
-        # Service 설정 변경
-        service = Service("/usr/bin/chromedriver") 
+        # [핵심] 서버 환경에서 크롬 위치를 자동으로 찾는 설정
+        options.binary_location = "/usr/bin/chromium" 
+        service = Service("/usr/bin/chromedriver")
         
-        driver = webdriver.Chrome(service=service, options=options)
         try:
-            driver.get(target_url)
-            time.sleep(5)
+            driver = webdriver.Chrome(service=service, options=options)
+        except Exception as e:
+            # 위 경로가 실패할 경우를 대비한 2차 경로 (OS 버전에 따라 다를 수 있음)
+            options.binary_location = "/usr/bin/chromium-browser"
+            service = Service("/usr/bin/chromium-browser.chromedriver")
+            driver = webdriver.Chrome(service=service, options=options)
 
             # 스크롤 로직
             last_height = driver.execute_script("return document.body.scrollHeight")
