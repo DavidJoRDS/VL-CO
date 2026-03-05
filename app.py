@@ -29,14 +29,16 @@ if st.button("데이터 수집 시작"):
             os.makedirs("img")
 
         options = Options()
-        options.add_argument("--headless") # 서버 실행을 위해 화면 띄우지 않음
+        options.add_argument("--headless") 
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
-
-        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-
+        options.add_argument("--disable-gpu") # 추가
+        options.binary_location = "/usr/bin/chromium-browser" # 서버 내 크롬 위치 강제 지정
+        
+        # Service 설정 변경
+        service = Service("/usr/bin/chromedriver") 
+        
+        driver = webdriver.Chrome(service=service, options=options)
         try:
             driver.get(target_url)
             time.sleep(5)
