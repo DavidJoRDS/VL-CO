@@ -6,6 +6,9 @@ from selenium.webdriver.common.by import By
 import time
 import requests
 import os
+import zipfile
+import shutil
+import re
 from io import BytesIO
 from PIL import Image as PILImage
 import openpyxl
@@ -20,10 +23,17 @@ st.title("🛒 범용 쇼핑몰 상품 크롤러")
 
 target_url = st.text_input("크롤링할 사이트 주소를 입력하세요", value="https://www.thenorthfacekorea.co.kr/category/n/whitelabel/womens?page=3")
 
+def clean_filename(filename):
+    """파일명으로 사용할 수 없는 특수문자 제거"""
+    return re.sub(r'[\\/*?:"<>|]', "", filename)
+
 if st.button("🚀 데이터 수집 시작"):
     with st.spinner('서버 인스턴스를 초기화하고 상품 정보를 수집 중입니다...'):
-        if not os.path.exists("img"):
-            os.makedirs("img")
+        # 이미지 저장 폴더 초기화
+        IMG_FOLDER = "collected_images"
+        if os.path.exists(IMG_FOLDER):
+            shutil.rmtree(IMG_FOLDER)
+        os.makedirs(IMG_FOLDER)
 
         options = Options()
         options.add_argument("--headless")
@@ -33,7 +43,6 @@ if st.button("🚀 데이터 수집 시작"):
         options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
 
         try:
-            # [수정] 경로를 강제하지 않고 시스템 설치본을 자동으로 찾도록 설정
             driver = webdriver.Chrome(options=options)
             driver.get(target_url)
             time.sleep(5)
@@ -48,7 +57,7 @@ if st.button("🚀 데이터 수집 시작"):
                     break
                 last_height = new_height
 
-            # 상품 탐색 (기존 crawler.py 로직 기반)
+            # 상품 탐색
             items = driver.find_elements(By.CSS_SELECTOR, ".item-box, .product-item, li[class*='item'], div[class*='product']")
             final_results = []
             seen_links = set()
@@ -79,7 +88,13 @@ if st.button("🚀 데이터 수집 시작"):
                         if len(img_urls) >= 2: break
 
                     if img_urls:
-                        final_results.append({"제품명": product_name, "정가": reg_price, "세일가": sale_price, "링크": link, "이미지들": img_urls})
+                        final_results.append({
+                            "제품명": product_name, 
+                            "정가": reg_price, 
+                            "세일가": sale_price, 
+                            "링크": link, 
+                            "이미지들": img_urls
+                        })
                         seen_links.add(link)
                 except: continue
 
@@ -88,7 +103,7 @@ if st.button("🚀 데이터 수집 시작"):
                 ws = wb.active
                 ws.append(["번호", "제품명", "이미지1", "이미지2", "정가", "세일가", "상세링크"])
                 
-                # 엑셀 스타일 설정 (기존 요청사항 유지)
+                # 엑셀 스타일 설정
                 ws.column_dimensions['B'].width = 45
                 ws.column_dimensions['C'].width = 30
                 ws.column_dimensions['D'].width = 30
@@ -109,22 +124,63 @@ if st.button("🚀 데이터 수집 시작"):
                     l_cell = ws.cell(row=row_idx, column=7, value="링크")
                     l_cell.hyperlink = data["링크"]
 
+                    # 이미지 다운로드 및 저장
+                    safe_name = clean_filename(data["제품명"])
                     for j, img_url in enumerate(data["이미지들"]):
                         try:
                             res = requests.get(img_url, timeout=5)
                             img_pil = PILImage.open(BytesIO(res.content)).convert("RGB")
-                            img_pil.thumbnail((200, 200))
-                            path = f"temp_{row_idx}_{j}.png"
-                            img_pil.save(path)
-                            ws.add_image(XLImage(path), f"{'C' if j==0 else 'D'}{row_idx}")
+                            
+                            # 1. 엑셀 삽입용 썸네일 저장
+                            img_thumb = img_pil.copy()
+                            img_thumb.thumbnail((200, 200))
+                            thumb_path = os.path.join(IMG_FOLDER, f"thumb_{row_idx}_{j}.png")
+                            img_thumb.save(thumb_path)
+                            ws.add_image(XLImage(thumb_path), f"{'C' if j==0 else 'D'}{row_idx}")
+                            
+                            # 2. 개별 이미지 파일 저장 (파일명: 제품명_번호.jpg)
+                            final_img_name = f"{i}_{safe_name}_{j+1}.jpg"
+                            img_pil.save(os.path.join(IMG_FOLDER, final_img_name), "JPEG", quality=90)
                         except: continue
 
+                # 엑셀 파일 메모리에 저장
                 excel_data = BytesIO()
                 wb.save(excel_data)
                 excel_data.seek(0)
 
+                # 이미지 폴더를 ZIP으로 압축
+                zip_buffer = BytesIO()
+                with zipfile.ZipFile(zip_buffer, "w") as zf:
+                    for root, dirs, files in os.walk(IMG_FOLDER):
+                        for file in files:
+                            # 썸네일용 임시 파일은 제외하고 실제 저장용 이미지만 압축
+                            if not file.startswith("thumb_"):
+                                zf.write(os.path.join(root, file), file)
+                zip_buffer.seek(0)
+
                 st.success(f"✅ {len(final_results)}개의 상품 수집 완료!")
-                st.download_button("📥 엑셀 파일 다운로드", excel_data, f"result_{datetime.datetime.now().strftime('%H%M%S')}.xlsx")
+
+                # 다운로드 버튼 가로 배치
+                col1, col2 = st.columns(2)
+                timestamp = datetime.datetime.now().strftime('%H%M%S')
+                with col1:
+                    st.download_button(
+                        label="📥 엑셀 파일 다운로드",
+                        data=excel_data,
+                        file_name=f"result_{timestamp}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                with col2:
+                    st.download_button(
+                        label="🖼️ 이미지 모음(.zip) 다운로드",
+                        data=zip_buffer,
+                        file_name=f"images_{timestamp}.zip",
+                        mime="application/zip"
+                    )
+                
+                # 서버 메모리 정리를 위해 임시 폴더 삭제
+                shutil.rmtree(IMG_FOLDER)
+
             else:
                 st.warning("상품을 찾지 못했습니다. 사이트 구조가 다르거나 로딩이 덜 되었을 수 있습니다.")
 
