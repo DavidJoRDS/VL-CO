@@ -13,13 +13,13 @@ from io import BytesIO
 from PIL import Image as PILImage
 import openpyxl
 from openpyxl.drawing.image import Image as XLImage
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 from openpyxl.styles import Alignment, Font
 import datetime
 
 # 페이지 설정
 st.set_page_config(page_title="VL&CO 상품크롤러", layout="wide")
-st.title("🛒 VL&CO 상품크롤러")
+st.title("🛒 VL&CO 상품크롤러 (성능 개선 버전)")
 
 if 'excel_data' not in st.session_state:
     st.session_state.excel_data = None
@@ -37,7 +37,7 @@ if st.button("🚀 데이터 수집 시작"):
     st.session_state.excel_data = None
     st.session_state.zip_data = None
     
-    with st.spinner('해당 사이트의 구조를 분석하여 상품을 찾는 중입니다...'):
+    with st.spinner('사이트 전체를 훑으며 상품과 이미지를 수집 중입니다. 잠시만 기다려 주세요...'):
         IMG_FOLDER = "collected_images"
         if os.path.exists(IMG_FOLDER):
             shutil.rmtree(IMG_FOLDER)
@@ -53,29 +53,32 @@ if st.button("🚀 데이터 수집 시작"):
         try:
             driver = webdriver.Chrome(options=options)
             driver.get(target_url)
-            time.sleep(7) # 로딩 대기 시간 증가
+            time.sleep(5)
 
-            # 스크롤 로직 (더 꼼꼼하게 스크롤)
-            for _ in range(3):
-                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(2)
+            # [개선 1] 더 깊고 정밀한 스크롤 (Lazy Loading 대응)
+            # 단순히 끝까지 내리는 게 아니라 조금씩 내려서 이미지가 로드될 시간을 줌
+            last_height = driver.execute_script("return document.body.scrollHeight")
+            for i in range(10): # 최대 10번 스크롤
+                driver.execute_script("window.scrollBy(0, 1000);") # 1000픽셀씩 이동
+                time.sleep(1.5)
+                new_height = driver.execute_script("return document.body.scrollHeight")
+                if i > 5 and new_height == last_height: break
+                last_height = new_height
 
-            # [핵심 변경] 범용 탐색 로직: '이미지'와 '텍스트'가 같이 들어있는 모든 묶음을 탐색
-            # li, div 중 상품 카드일 확률이 높은 요소들을 광범위하게 수집
-            items = driver.find_elements(By.CSS_SELECTOR, "li, div[class*='prod'], div[class*='item'], div[class*='Unit'], a[class*='product']")
+            # [개선 2] 상품 탐색 범위 확장
+            items = driver.find_elements(By.CSS_SELECTOR, "li, div[class*='prod'], div[class*='item'], div[class*='Unit'], a[class*='product'], .mcl-product-grid-item")
             
             final_results = []
             seen_links = set()
 
             for item in items:
                 try:
-                    # 너무 작거나 텍스트가 없는 요소는 패스
-                    if item.size['width'] < 100 or item.size['height'] < 100: continue
+                    if item.size['width'] < 50 or item.size['height'] < 50: continue
                     
                     full_text = item.text.strip()
-                    if not full_text or not any(c.isdigit() for c in full_text): continue
+                    if not full_text: continue
                     
-                    # 링크 찾기
+                    # 링크 추출
                     link = ""
                     try:
                         if item.tag_name == 'a':
@@ -86,40 +89,42 @@ if st.button("🚀 데이터 수집 시작"):
                     
                     if not link or link in seen_links or "javascript" in link: continue
 
-                    # 이미지 찾기
+                    # [개선 3] 이미지 추출 로직 강화 (다양한 속성 체크)
                     img_urls = []
                     images = item.find_elements(By.TAG_NAME, 'img')
                     for img in images:
-                        src = img.get_attribute('data-src') or img.get_attribute('data-original') or img.get_attribute('src')
+                        # 사이트마다 다른 이미지 저장 속성을 모두 뒤짐
+                        src = (img.get_attribute('data-src') or 
+                               img.get_attribute('data-original') or 
+                               img.get_attribute('src') or 
+                               img.get_attribute('srcset') or
+                               img.get_attribute('data-lazy-src'))
+                        
                         if src:
+                            if ' ' in src: src = src.split(' ')[0] # srcset 대응
                             src = urljoin(target_url, src)
-                            if 'http' in src and not any(x in src.lower() for x in ['logo', 'icon', 'btn', 'svg']):
-                                img_urls.append(src)
+                            if 'http' in src and not any(x in src.lower() for x in ['logo', 'icon', 'btn', 'svg', 'gif']):
+                                if src not in img_urls: img_urls.append(src)
                         if len(img_urls) >= 2: break
                     
-                    if not img_urls: continue
+                    if not img_urls: continue # 이미지가 없으면 상품이 아니라고 판단
 
-                    # 이름 및 가격 추출 (줄바꿈 기준 첫 줄은 이름, '원'이나 ',' 포함된 줄은 가격)
                     lines = [l.strip() for l in full_text.split('\n') if l.strip()]
                     p_name = lines[0] if lines else "상품명 없음"
-                    p_price = "정보없음"
-                    s_price = "-"
                     
+                    # 가격 추출
                     prices = [l for l in lines if any(x in l for x in ['원', '₩', 'KRW', ',']) and any(c.isdigit() for c in l)]
-                    if prices:
-                        p_price = prices[0]
-                        if len(prices) > 1: s_price = prices[1]
+                    p_price = prices[0] if prices else "정보없음"
+                    s_price = prices[1] if len(prices) > 1 else "-"
 
                     final_results.append({
-                        "제품명": p_name[:50], # 너무 길면 생략
+                        "제품명": p_name[:100],
                         "정가": p_price,
                         "세일가": s_price,
                         "링크": link,
                         "이미지들": img_urls
                     })
                     seen_links.add(link)
-                    
-                    if len(final_results) >= 80: break # 최대 수집량 제한 (메모리 보호)
                 except: continue
 
             if final_results:
@@ -146,17 +151,16 @@ if st.button("🚀 데이터 수집 시작"):
                     safe_name = clean_filename(data["제품명"])
                     for j, img_url in enumerate(data["이미지들"]):
                         try:
-                            res = requests.get(img_url, timeout=5)
+                            # [개선 4] 이미지 다운로드 헤더 추가 (차단 방지)
+                            res = requests.get(img_url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
                             img_pil = PILImage.open(BytesIO(res.content)).convert("RGB")
                             
-                            # 썸네일 생성 및 엑셀 삽입
                             img_thumb = img_pil.copy()
                             img_thumb.thumbnail((180, 180))
                             t_path = os.path.join(IMG_FOLDER, f"t_{row_idx}_{j}.png")
                             img_thumb.save(t_path)
                             ws.add_image(XLImage(t_path), f"{'C' if j==0 else 'D'}{row_idx}")
                             
-                            # ZIP 저장용 원본급 이미지
                             img_pil.save(os.path.join(IMG_FOLDER, f"{i}_{safe_name}_{j+1}.jpg"), "JPEG", quality=85)
                         except: continue
 
@@ -174,16 +178,15 @@ if st.button("🚀 데이터 수집 시작"):
                 st.session_state.result_count = len(final_results)
                 shutil.rmtree(IMG_FOLDER)
             else:
-                st.warning("이 사이트의 상품 구조를 파악하지 못했습니다. 주소를 다시 확인해 주세요.")
+                st.warning("상품 정보를 찾을 수 없습니다.")
 
         except Exception as e:
             st.error(f"오류: {str(e)}")
         finally:
             if 'driver' in locals(): driver.quit()
 
-# 결과 표시
 if st.session_state.excel_data:
-    st.success(f"✅ {st.session_state.result_count}개의 상품 데이터를 찾았습니다!")
+    st.success(f"✅ 총 {st.session_state.result_count}개의 상품 데이터를 수집했습니다!")
     c1, c2 = st.columns(2)
     with c1:
         st.download_button("📥 엑셀 다운로드", st.session_state.excel_data, "result.xlsx")
