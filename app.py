@@ -18,8 +18,8 @@ from openpyxl.styles import Alignment, Font
 import datetime
 
 # 페이지 설정
-st.set_page_config(page_title="범용 쇼핑몰 크롤러", layout="wide")
-st.title("🛒 범용 쇼핑몰 상품 크롤러")
+st.set_page_config(page_title="VL&CO 상품크롤러", layout="wide")
+st.title("🛒 VL&CO 상품크롤러")
 
 # 세션 상태 초기화 (수집된 데이터를 보관하는 저장소)
 if 'excel_data' not in st.session_state:
