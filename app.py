@@ -40,166 +40,167 @@ target_url = st.text_input(
 )
 
 # ─────────────────────────────────────────
-# 가격 파싱 유틸
+# 유틸: 숫자 추출
 # ─────────────────────────────────────────
+NUM_PATTERN = re.compile(r'[\$¥€£₩]?\s*[\d,]+(?:\.\d+)?')
 
-# 가격 줄 판별: 화폐 기호 또는 4자리+ 숫자 포함
-PRICE_MARKERS = ['원', 'KRW', '₩', '$', '¥', '€', '£']
-NUM_IN_LINE = re.compile(r'\d{1,3}(?:,\d{3})+|\d{4,}')
-PCT_ONLY = re.compile(r'^\d+\s*%')   # "30%" 처럼 퍼센트만 있는 줄 제외
-
-def get_price_lines(inner_text: str) -> list:
-    """
-    innerText를 줄 단위로 쪼개서 가격이 포함된 줄만 반환.
-    퍼센트 할인율 줄(예: '30% OFF')은 제외.
-    옛날 코드의 검증된 방식.
-    """
-    lines = [l.strip() for l in inner_text.split('\n') if l.strip()]
-    result = []
-    for line in lines:
-        if PCT_ONLY.match(line):
+def extract_numbers(text: str) -> list:
+    results = []
+    for m in NUM_PATTERN.findall(text):
+        cleaned = re.sub(r'[^\d.]', '', m)
+        try:
+            val = float(cleaned)
+            if val >= 100:
+                results.append(val)
+        except ValueError:
             continue
-        has_marker = any(m in line for m in PRICE_MARKERS)
-        has_num    = bool(NUM_IN_LINE.search(line))
-        if has_marker or has_num:
-            result.append(line)
-    return result
+    return results
 
-def extract_int(s: str) -> int:
-    """문자열에서 숫자만 추출해 int 반환"""
-    cleaned = re.sub(r'[^\d]', '', s)
-    return int(cleaned) if cleaned else 0
-
-def calc_discount_pct(reg_str: str, sale_str: str) -> int:
-    """정가/세일가 문자열로 할인율(%) 계산"""
-    r = extract_int(reg_str)
-    s = extract_int(sale_str)
-    if r > 0 and 0 < s < r:
-        return round((r - s) / r * 100)
-    return 0
-
-def format_sale(sale_str: str, pct: int) -> str:
-    """세일가 표시 문자열: '90,300원 (30% 할인)'"""
-    if pct > 0:
-        return f"{sale_str} ({pct}% 할인)"
-    return sale_str
+def fmt_price(val: float) -> str:
+    if val == int(val):
+        return f"{int(val):,}"
+    return f"{val:,.0f}"
 
 
 # ─────────────────────────────────────────
-# 세일가 판별 (취소선 우선 → innerText 줄 파싱)
+# 세일가 정밀 판별 (완전 재설계)
+#
+# [핵심 설계 원칙]
+# 단계별 신뢰도 순서로 탐색하되, 반드시 마지막 fallback까지 도달
+# → sale_kw만 발견되어도 4단계로 넘어감 (이전 버전 버그 수정)
 # ─────────────────────────────────────────
-def get_refined_prices(driver, item_element):
-    """
-    반환: (정가_str, 세일가_str, 경고_str)
-
-    [전략]
-    1) strike/del/s 태그 또는 CSS line-through → 확실한 정가 판별
-       → 취소선 발견 시 정가 확정, 세일가는 innerText 줄에서 추출
-    2) innerText 줄 기반 파싱 (옛날 코드 검증 방식)
-       → 가격 포함 줄 목록에서 첫 번째=정가, 두 번째=세일가
-       → 단, 두 번째 값이 첫 번째보다 크면 순서가 반대인 사이트 → 스왑
-    3) 할인율은 정가/세일가 숫자 차이로 자동 계산
-    """
+def get_refined_prices(driver, item_element, product_name=""):
     warn = ""
     try:
-        # innerText로 텍스트 추출 (headless에서 .text보다 안정적)
-        try:
-            inner_text = driver.execute_script(
-                "return arguments[0].innerText;", item_element
-            ) or ""
-        except Exception:
-            inner_text = item_element.text or ""
+        full_text = item_element.text.strip()
 
-        # ── 1단계: 취소선 태그 탐색 ──────────────────────
-        # 취소선이 있으면 해당 요소의 텍스트 = 정가로 확정
-        reg_from_strike = None
+        # ── 1단계: 취소선 HTML 태그 ──────────────────────
         for sel in ["strike", "del", "s",
-                    "[style*='line-through']"]:
+                    "span[style*='line-through']",
+                    "p[style*='line-through']"]:
             tags = item_element.find_elements(By.CSS_SELECTOR, sel)
             if not tags:
                 continue
             tag = tags[0]
-            # .text가 비어있으면 innerHTML에서 추출
-            tag_text = tag.text.strip()
-            if not tag_text:
+            reg_text = tag.text.strip()
+            # .text가 빈 경우 innerHTML에서 직접 숫자 추출 (CSS only 취소선 대응)
+            if not reg_text:
                 try:
-                    html = driver.execute_script("return arguments[0].innerHTML;", tag)
-                    tag_text = re.sub(r'<[^>]+>', '', html).strip()
+                    inner = driver.execute_script("return arguments[0].innerHTML;", tag)
+                    reg_text = re.sub(r'<[^>]+>', '', inner).strip()
                 except Exception:
                     pass
-            if tag_text and (extract_int(tag_text) > 0):
-                reg_from_strike = tag_text
-                break
-
-        # ── 2단계: CSS computed line-through 탐색 ────────
-        if reg_from_strike is None:
-            for tag in item_element.find_elements(
-                By.CSS_SELECTOR, "span, p, em, strong, b, div"
-            )[:20]:
-                try:
-                    td = driver.execute_script(
-                        "return window.getComputedStyle(arguments[0]).textDecoration;",
-                        tag
-                    )
-                    if td and "line-through" in td:
-                        tag_text = tag.text.strip()
-                        if tag_text and extract_int(tag_text) > 0:
-                            reg_from_strike = tag_text
-                            break
-                except Exception:
-                    continue
-
-        # ── 3단계: innerText 줄 기반 파싱 ────────────────
-        price_lines = get_price_lines(inner_text)
-
-        if not price_lines:
-            warn = "가격 줄을 찾을 수 없음 (innerText에 가격 없음)"
-            return "정보없음", "-", warn
-
-        if reg_from_strike:
-            # 취소선으로 정가 확정 → 나머지 줄에서 세일가 탐색
-            reg_str = reg_from_strike
-            reg_int = extract_int(reg_str)
-            sale_candidates = [
-                l for l in price_lines
-                if l != reg_str and 0 < extract_int(l) < reg_int
-            ]
+            reg_nums = extract_numbers(reg_text)
+            if not reg_nums:
+                continue
+            reg_val = reg_nums[0]
+            rest = full_text.replace(reg_text, "", 1)
+            sale_candidates = [v for v in extract_numbers(rest) if 0 < v < reg_val]
             if sale_candidates:
-                sale_str = sale_candidates[0]
-                pct = calc_discount_pct(reg_str, sale_str)
-                return reg_str, format_sale(sale_str, pct), ""
-            else:
-                return reg_str, "-", ""
-        else:
-            # 취소선 없음 → 줄 순서로 판별
-            if len(price_lines) >= 2:
-                first_int  = extract_int(price_lines[0])
-                second_int = extract_int(price_lines[1])
+                return fmt_price(reg_val), fmt_price(max(sale_candidates)), ""
+            # 취소선 있지만 세일가 후보 없음 → 4단계로 fallthrough
+            break
 
-                if first_int > 0 and second_int > 0:
-                    if first_int > second_int:
-                        # 정상: 첫 번째=정가, 두 번째=세일가
-                        reg_str  = price_lines[0]
-                        sale_str = price_lines[1]
-                    elif second_int > first_int:
-                        # 역순 사이트: 두 번째=정가, 첫 번째=세일가
-                        reg_str  = price_lines[1]
-                        sale_str = price_lines[0]
-                    else:
-                        # 동일 가격 → 세일 없음
-                        return price_lines[0], "-", ""
+        # ── 2단계: JS computed style line-through ────────
+        child_tags = item_element.find_elements(By.CSS_SELECTOR, "span, p, em, strong, b")
+        for tag in child_tags[:20]:
+            try:
+                td = driver.execute_script(
+                    "return window.getComputedStyle(arguments[0]).textDecoration;", tag
+                )
+                if not (td and "line-through" in td):
+                    continue
+                reg_text = tag.text.strip()
+                reg_nums = extract_numbers(reg_text)
+                if not reg_nums:
+                    continue
+                reg_val = reg_nums[0]
+                rest = full_text.replace(reg_text, "", 1)
+                sale_candidates = [v for v in extract_numbers(rest) if 0 < v < reg_val]
+                if sale_candidates:
+                    return fmt_price(reg_val), fmt_price(max(sale_candidates)), ""
+                break  # 취소선 있지만 세일가 없음 → 4단계로
+            except Exception:
+                continue
 
-                    pct = calc_discount_pct(reg_str, sale_str)
-                    return reg_str, format_sale(sale_str, pct), ""
-                else:
-                    return price_lines[0], "-", ""
-            elif len(price_lines) == 1:
-                return price_lines[0], "-", ""
+        # ── 3단계: 클래스명 키워드 ───────────────────────
+        # 정가+세일가 모두 발견된 경우에만 반환
+        # sale_kw만 발견 → 반환하지 않고 4단계로 넘어감 (★핵심 수정)
+        ORIGIN_KW = [
+            "consumer",        # 카페24 소비자가(정가)
+            "origin", "original", "origin-price", "originprice",
+            "regular", "regular-price", "regularprice",
+            "old", "old-price", "oldprice",
+            "before", "before-price",
+            "crossed", "crossed-price",
+            "retail", "list-price", "listprice",
+            "was", "was-price", "msrp",
+            "compare", "compare-at",
+            "normal", "normal-price", "normalprice",
+            "price-origin",
+        ]
+        SALE_KW = [
+            "selling",         # 카페24 판매가
+            "sale-price", "saleprice", "price-sale",
+            "discount", "discounted",
+            "special", "special-price",
+            "final", "final-price",
+            "offer", "offer-price",
+            "promo", "promo-price",
+            "saving",
+        ]
+
+        reg_val_kw = None
+        sale_val_kw = None
+        for tag in item_element.find_elements(By.CSS_SELECTOR, "span, div, p, em, strong, b")[:40]:
+            try:
+                cls = (tag.get_attribute("class") or "").lower()
+                tid = (tag.get_attribute("id") or "").lower()
+                combined = cls + " " + tid
+                nums = extract_numbers(tag.text.strip())
+                if not nums:
+                    continue
+                val = nums[0]
+                if reg_val_kw is None and any(kw in combined for kw in ORIGIN_KW):
+                    reg_val_kw = val
+                elif sale_val_kw is None and any(kw in combined for kw in SALE_KW):
+                    sale_val_kw = val
+            except Exception:
+                continue
+
+        if reg_val_kw is not None and sale_val_kw is not None:
+            return fmt_price(reg_val_kw), fmt_price(sale_val_kw), ""
+        if reg_val_kw is not None:
+            # 정가 클래스만 발견 → 전체 텍스트에서 정가보다 작은 숫자 탐색
+            rest_candidates = [v for v in extract_numbers(full_text) if 0 < v < reg_val_kw]
+            if rest_candidates:
+                return fmt_price(reg_val_kw), fmt_price(max(rest_candidates)), ""
+            return fmt_price(reg_val_kw), "-", ""
+        # sale_kw만 발견되거나 아무것도 없으면 → 4단계로 계속
+
+        # ── 4단계: 전체 텍스트 숫자 fallback (가장 범용적) ──
+        # item.text에서 모든 가격 숫자를 추출해 크기 비교
+        # 숫자 2개 이상 → 큰값=정가, 작은값=세일가
+        # 숫자 1개 → 정가만 (세일 없음)
+        all_vals = extract_numbers(full_text)
+        seen_set = set()
+        unique_vals = []
+        for v in all_vals:
+            if v not in seen_set:
+                seen_set.add(v)
+                unique_vals.append(v)
+
+        if len(unique_vals) >= 2:
+            sorted_vals = sorted(unique_vals, reverse=True)
+            return fmt_price(sorted_vals[0]), fmt_price(sorted_vals[1]), ""
+        elif len(unique_vals) == 1:
+            return fmt_price(unique_vals[0]), "-", ""
 
     except Exception as e:
         warn = f"가격 추출 예외: {e}"
 
-    return "정보없음", "-", warn or "가격 정보를 찾을 수 없음"
+    warn = warn or "가격 정보를 찾을 수 없음"
+    return "정보없음", "-", warn
 
 
 # ─────────────────────────────────────────
@@ -219,7 +220,6 @@ def scroll_to_bottom(driver, log_fn, pause: float = 0.6, max_rounds: int = 40):
             last_height = driver.execute_script("return document.body.scrollHeight")
         else:
             last_height = new_height
-    # 맨 위 → 다시 끝 (끝부분 누락 방지)
     driver.execute_script("window.scrollTo(0, 0);")
     time.sleep(0.3)
     driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
@@ -306,7 +306,7 @@ if start_btn:
         st.error("URL을 입력해주세요.")
         st.stop()
 
-    # 새 수집 → 이전 데이터 초기화
+    # 새 수집 시작 → 이전 데이터 초기화
     st.session_state.logs = []
     st.session_state.excel_data = None
     st.session_state.zip_data = None
@@ -358,11 +358,11 @@ if start_btn:
             "div.xans-product-listitem",
             # 상품 카드
             "[class*='product-card']", "[class*='ProductCard']", "[class*='product_card']",
-            "[class*='item-card']",    "[class*='ItemCard']",
+            "[class*='item-card']", "[class*='ItemCard']",
             # 그리드/리스트
             "[class*='product-item']", "[class*='productItem']", "[class*='product_item']",
-            "[class*='goods-item']",   "[class*='goodsItem']",   "[class*='item-wrap']",
-            # article / li
+            "[class*='goods-item']", "[class*='goodsItem']", "[class*='item-wrap']",
+            # article/li
             "article[class*='product']", "article[class*='item']",
             "li[class*='product']", "li[class*='item']", "li[class*='goods']",
             # 링크 기반
@@ -383,8 +383,7 @@ if start_btn:
                 try:
                     if c.size['width'] < 80 or c.size['height'] < 80:
                         continue
-                    if (c.find_elements(By.TAG_NAME, 'a') and
-                            c.find_elements(By.TAG_NAME, 'img')):
+                    if c.find_elements(By.TAG_NAME, 'a') and c.find_elements(By.TAG_NAME, 'img'):
                         valid.append(c)
                 except Exception:
                     continue
@@ -415,8 +414,7 @@ if start_btn:
             try:
                 # 링크
                 try:
-                    link_tag = (item if item.tag_name == 'a'
-                                else item.find_element(By.TAG_NAME, 'a'))
+                    link_tag = item if item.tag_name == 'a' else item.find_element(By.TAG_NAME, 'a')
                     link = link_tag.get_attribute('href') or ""
                 except Exception:
                     skip_count += 1
@@ -426,26 +424,19 @@ if start_btn:
                     skip_count += 1
                     continue
 
-                # innerText로 상품 텍스트 추출 (옛날 코드 방식 - 더 안정적)
-                try:
-                    item_text = driver.execute_script(
-                        "return arguments[0].innerText;", item
-                    ) or ""
-                except Exception:
-                    item_text = item.text or ""
-
-                if len(item_text.strip()) < 5:
+                item_text = item.text.strip()
+                if len(item_text) < 5:
                     skip_count += 1
                     continue
 
-                # 상품명: 첫 번째 줄
+                # 상품명
                 lines = [l.strip() for l in item_text.split('\n') if l.strip()]
                 p_name = lines[0] if lines else "이름없음"
                 if len(p_name) < 3 and len(lines) > 1:
                     p_name = lines[1]
 
-                # 가격 추출
-                reg_p, sale_p, price_warn = get_refined_prices(driver, item)
+                # 가격
+                reg_p, sale_p, price_warn = get_refined_prices(driver, item, p_name)
                 if price_warn:
                     item_warn.append(f"가격: {price_warn}")
 
@@ -469,8 +460,7 @@ if start_btn:
                         src_lower = src.lower()
                         if any(x in src_lower for x in [
                             'swatch', 'color', 'icon', 'logo', 'banner',
-                            'pixel', 'spacer', 'blank', '1x1',
-                            'placeholder', 'loading'
+                            'pixel', 'spacer', 'blank', '1x1', 'placeholder', 'loading'
                         ]):
                             continue
                         img_urls.append(urljoin(target_url, src))
@@ -483,21 +473,17 @@ if start_btn:
                     item_warn.append("이미지 URL 없음")
                     skip_count += 1
                     if item_warn:
-                        warn_logs.append(
-                            f"  ⚠️ [{idx}] {p_name[:40]} → {' / '.join(item_warn)}"
-                        )
+                        warn_logs.append(f"  ⚠️ [{idx}] {p_name[:40]} → {' / '.join(item_warn)}")
                     continue
 
                 if item_warn:
-                    warn_logs.append(
-                        f"  ⚠️ [{idx}] {p_name[:40]} → {' / '.join(item_warn)}"
-                    )
+                    warn_logs.append(f"  ⚠️ [{idx}] {p_name[:40]} → {' / '.join(item_warn)}")
 
                 final_results.append({
-                    "제품명":  p_name[:80],
-                    "정가":    reg_p,
-                    "세일가":  sale_p,
-                    "링크":    link,
+                    "제품명": p_name[:80],
+                    "정가": reg_p,
+                    "세일가": sale_p,
+                    "링크": link,
                     "이미지들": img_urls,
                 })
                 seen_links.add(link)
@@ -553,12 +539,11 @@ if start_btn:
                 img_results[(ii, jj)] = tp if ok else None
                 if not ok:
                     dl_fail_logs.append(
-                        f"  ⚠️ 이미지 다운 실패 [상품#{ii} img{jj+1}]: "
-                        f"{err_msg} | {url[:55]}..."
+                        f"  ⚠️ 이미지 다운 실패 [상품#{ii} img{jj+1}]: {err_msg} | {url[:55]}..."
                     )
                 completed_dl += 1
                 if completed_dl % 20 == 0:
-                    log(f"  🖼️ 이미지 {completed_dl}/{len(download_tasks)} 완료...")
+                    log(f"  🖼️ 이미지 {completed_dl}/{len(download_tasks)} 다운로드 완료...")
 
         log(f"  ✅ 이미지 다운로드 완료 ({completed_dl}개 처리, 실패 {len(dl_fail_logs)}건)")
         for w in dl_fail_logs[:20]:
@@ -586,30 +571,22 @@ if start_btn:
         ws.column_dimensions['C'].width = 28
         ws.column_dimensions['D'].width = 28
         ws.column_dimensions['E'].width = 18
-        ws.column_dimensions['F'].width = 26   # 세일가 + 할인율 표시용으로 넓게
+        ws.column_dimensions['F'].width = 22
         ws.column_dimensions['G'].width = 14
 
         for i, data in enumerate(final_results, start=1):
             row_idx = i + 1
             ws.row_dimensions[row_idx].height = 165
 
-            ws.cell(row=row_idx, column=1, value=i).alignment = Alignment(
-                horizontal='center', vertical='center'
-            )
-            ws.cell(row=row_idx, column=2, value=data["제품명"]).alignment = Alignment(
-                wrap_text=True, vertical='center'
-            )
-            ws.cell(row=row_idx, column=5, value=data["정가"]).alignment = Alignment(
-                horizontal='center', vertical='center'
-            )
+            ws.cell(row=row_idx, column=1, value=i).alignment = Alignment(horizontal='center', vertical='center')
+            ws.cell(row=row_idx, column=2, value=data["제품명"]).alignment = Alignment(wrap_text=True, vertical='center')
+            ws.cell(row=row_idx, column=5, value=data["정가"]).alignment = Alignment(horizontal='center', vertical='center')
 
-            # 세일가 (할인율 포함 문자열, 빨간 볼드)
+            # 세일가
             s_cell = ws.cell(row=row_idx, column=6)
-            s_cell.alignment = Alignment(
-                horizontal='center', vertical='center', wrap_text=True
-            )
+            s_cell.alignment = Alignment(horizontal='center', vertical='center')
             if data["세일가"] != "-":
-                s_cell.value = data["세일가"]   # 이미 "90,300원 (30% 할인)" 형식
+                s_cell.value = f"▼ {data['세일가']}"
                 s_cell.font = Font(color="CC0000", bold=True, size=11)
             else:
                 s_cell.value = "-"
