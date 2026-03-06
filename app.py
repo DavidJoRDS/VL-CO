@@ -21,8 +21,8 @@ import datetime
 # 페이지 설정
 # ─────────────────────────────────────────
 st.set_page_config(page_title="VL&CO 상품크롤러", layout="wide")
-st.title("🛒 VL&CO 상품크롤러")
-st.caption("국내외 모든 쇼핑몰 범용 | 세일가 정밀 판별 | 빠른 병렬 수집")
+st.title("VL&CO 상품크롤러")
+st.caption("쇼핑몰 상품리스트 페이지 크롤링하여 엑셀 / 이미지 저장 (구조가 다른 특정사이트 에러 있을 수 있음)")
 
 # ─────────────────────────────────────────
 # 세션 상태 초기화
@@ -354,7 +354,7 @@ def render_logs(logs: list, placeholder):
 # ─────────────────────────────────────────
 # 버튼 + 로그 (항상 고정 순서 렌더링)
 # ─────────────────────────────────────────
-start_btn = st.button("🚀 데이터 수집 시작", type="primary")
+start_btn = st.button("데이터 수집 시작", type="primary")
 
 log_placeholder = st.empty()
 if st.session_state.logs:
