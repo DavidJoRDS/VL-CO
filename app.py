@@ -61,6 +61,14 @@ def fmt_price(val: float) -> str:
         return f"{int(val):,}"
     return f"{val:,.0f}"
 
+def fmt_sale_with_pct(sale_val: float, reg_val: float) -> str:
+    """세일가 문자열에 할인율 퍼센트 추가: '188,100 (20%)'"""
+    sale_str = fmt_price(sale_val)
+    if reg_val > 0 and 0 < sale_val < reg_val:
+        pct = round((reg_val - sale_val) / reg_val * 100)
+        return f"{sale_str} ({pct}%)"
+    return sale_str
+
 
 # ─────────────────────────────────────────
 # 세일가 정밀 판별 (완전 재설계)
@@ -97,7 +105,8 @@ def get_refined_prices(driver, item_element, product_name=""):
             rest = full_text.replace(reg_text, "", 1)
             sale_candidates = [v for v in extract_numbers(rest) if 0 < v < reg_val]
             if sale_candidates:
-                return fmt_price(reg_val), fmt_price(max(sale_candidates)), ""
+                sale_val = max(sale_candidates)
+                return fmt_price(reg_val), fmt_sale_with_pct(sale_val, reg_val), ""
             # 취소선 있지만 세일가 후보 없음 → 4단계로 fallthrough
             break
 
@@ -118,7 +127,8 @@ def get_refined_prices(driver, item_element, product_name=""):
                 rest = full_text.replace(reg_text, "", 1)
                 sale_candidates = [v for v in extract_numbers(rest) if 0 < v < reg_val]
                 if sale_candidates:
-                    return fmt_price(reg_val), fmt_price(max(sale_candidates)), ""
+                    sale_val = max(sale_candidates)
+                    return fmt_price(reg_val), fmt_sale_with_pct(sale_val, reg_val), ""
                 break  # 취소선 있지만 세일가 없음 → 4단계로
             except Exception:
                 continue
@@ -169,12 +179,13 @@ def get_refined_prices(driver, item_element, product_name=""):
                 continue
 
         if reg_val_kw is not None and sale_val_kw is not None:
-            return fmt_price(reg_val_kw), fmt_price(sale_val_kw), ""
+            return fmt_price(reg_val_kw), fmt_sale_with_pct(sale_val_kw, reg_val_kw), ""
         if reg_val_kw is not None:
             # 정가 클래스만 발견 → 전체 텍스트에서 정가보다 작은 숫자 탐색
             rest_candidates = [v for v in extract_numbers(full_text) if 0 < v < reg_val_kw]
             if rest_candidates:
-                return fmt_price(reg_val_kw), fmt_price(max(rest_candidates)), ""
+                sale_val = max(rest_candidates)
+                return fmt_price(reg_val_kw), fmt_sale_with_pct(sale_val, reg_val_kw), ""
             return fmt_price(reg_val_kw), "-", ""
         # sale_kw만 발견되거나 아무것도 없으면 → 4단계로 계속
 
@@ -192,7 +203,7 @@ def get_refined_prices(driver, item_element, product_name=""):
 
         if len(unique_vals) >= 2:
             sorted_vals = sorted(unique_vals, reverse=True)
-            return fmt_price(sorted_vals[0]), fmt_price(sorted_vals[1]), ""
+            return fmt_price(sorted_vals[0]), fmt_sale_with_pct(sorted_vals[1], sorted_vals[0]), ""
         elif len(unique_vals) == 1:
             return fmt_price(unique_vals[0]), "-", ""
 
@@ -586,7 +597,7 @@ if start_btn:
             s_cell = ws.cell(row=row_idx, column=6)
             s_cell.alignment = Alignment(horizontal='center', vertical='center')
             if data["세일가"] != "-":
-                s_cell.value = f"▼ {data['세일가']}"
+                s_cell.value = data["세일가"]   # 예: '188,100 (20%)'
                 s_cell.font = Font(color="CC0000", bold=True, size=11)
             else:
                 s_cell.value = "-"
