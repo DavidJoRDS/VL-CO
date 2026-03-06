@@ -2,8 +2,6 @@ import streamlit as st
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 import time
 import requests
 import os
@@ -19,43 +17,52 @@ from openpyxl.styles import Alignment, Font
 import datetime
 
 st.set_page_config(page_title="VL&CO 상품크롤러", layout="wide")
-st.title("🚀 VL&CO 최종 통합 크롤러")
+st.title("🛒 VL&CO 상품크롤러 (세일가 완벽 보완)")
 
 if 'excel_data' not in st.session_state:
     st.session_state.excel_data = None
 if 'zip_data' not in st.session_state:
     st.session_state.zip_data = None
 
-target_url = st.text_input("크롤링할 사이트 주소", value="")
+target_url = st.text_input("크롤링할 사이트 주소를 입력하세요", value="")
 
-def extract_prices(item_element):
-    """요소 내의 모든 텍스트를 분석하여 정가와 할인가를 정확히 분리"""
-    # innerText를 사용하여 줄바꿈이 포함된 텍스트 전체 획득
+def clean_filename(filename):
+    return re.sub(r'[\\/*?:"<>|]', "", filename)
+
+def get_refined_prices(item_element):
+    """이전 코드의 '순차 추출' 장점을 살려 가격을 분리"""
+    # innerText를 가져와서 줄바꿈 단위로 분리
     full_text = item_element.text.strip()
     lines = [l.strip() for l in full_text.split('\n') if l.strip()]
     
-    # 숫자와 가격 관련 기호가 포함된 모든 문구 추출
     price_candidates = []
     for line in lines:
-        if any(c.isdigit() for c in line) and any(x in line for x in ['원', '₩', 'KRW', ',']):
-            # 한 줄에 여러 가격이 있을 경우 분리 (예: "100,000 80,000")
-            matches = re.findall(r'[0-9,]{3,}', line)
-            if len(matches) > 1:
-                price_candidates.extend([m + "원" if '원' in line else m for m in matches])
+        # 1. 화폐 단위나 콤마가 포함된 줄을 찾음
+        if any(x in line for x in ['원', 'KRW', '₩', 'JPY', 'USD', ',']) and any(c.isdigit() for c in line):
+            # 2. 한 줄에 가격이 여러 개(정가+세일가) 있는 경우를 대비해 숫자 패턴으로 재분할
+            # 콤마 포함 숫자를 찾되, 너무 짧은 숫자는 제외
+            found = re.findall(r'[0-9,]{3,}', line)
+            if len(found) >= 2:
+                # 한 줄에 두 개 이상의 가격이 있다면 각각 추가
+                for f in found:
+                    price_candidates.append(f.strip())
             else:
+                # 한 줄에 하나라면 줄 전체 추가 (단위 포함 목적)
                 price_candidates.append(line)
 
-    # 중복 제거 및 정리
-    final_p = []
+    # 중복 제거 (순서 유지)
+    unique_prices = []
     for p in price_candidates:
-        if p not in final_p: final_p.append(p)
+        if p not in unique_prices: unique_prices.append(p)
 
-    if len(final_p) >= 2:
-        return final_p[0], final_p[1] # 첫 번째가 보통 정가, 두 번째가 할인가
-    return (final_p[0], "-") if final_p else ("정보없음", "-")
+    # 최종 배정: 첫 번째 발견 가격은 정가, 두 번째는 세일가
+    reg_p = unique_prices[0] if len(unique_prices) >= 1 else "정보없음"
+    sale_p = unique_prices[1] if len(unique_prices) >= 2 else "-"
+    
+    return reg_p, sale_p
 
 if st.button("🚀 데이터 수집 시작"):
-    with st.spinner('레이아웃과 가격 데이터를 정밀하게 분석 중입니다...'):
+    with st.spinner('가격 정보를 정밀 분석하며 수집 중입니다...'):
         IMG_FOLDER = "collected_images"
         if os.path.exists(IMG_FOLDER): shutil.rmtree(IMG_FOLDER)
         os.makedirs(IMG_FOLDER)
@@ -64,22 +71,19 @@ if st.button("🚀 데이터 수집 시작"):
         options.add_argument("--headless")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
-        # [수정] 행 높이 계산을 위해 이미지 로딩 비활성화 옵션 제거
         options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 
         try:
             driver = webdriver.Chrome(options=options)
             driver.get(target_url)
-            
-            # 페이지 로딩 대기
-            WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-            
-            # 효율적 스크롤 (개수 확보를 위해 3번 수행)
+            time.sleep(5)
+
+            # 스크롤 최적화
             for _ in range(3):
                 driver.execute_script("window.scrollBy(0, 2000);")
-                time.sleep(1)
+                time.sleep(1.5)
 
-            # 탐색 범위 확장
+            # 상품 탐색 (범용 선택자 유지)
             items = driver.find_elements(By.CSS_SELECTOR, "li, div[class*='item'], div[class*='product'], a[class*='product']")
             
             final_results = []
@@ -92,7 +96,15 @@ if st.button("🚀 데이터 수집 시작"):
                     link = link_tag.get_attribute('href')
                     if not link or link in seen_links or "javascript" in link: continue
 
-                    # 이미지 추출 로직 (컬러칩 제외)
+                    # 가격 추출 (보완된 로직 적용)
+                    reg_price, sale_price = get_refined_prices(item)
+                    
+                    # 상품명 추출 (배너 제외)
+                    lines = [l.strip() for l in item.text.split('\n') if l.strip()]
+                    p_name = lines[0] if lines else "상품명 없음"
+                    if len(p_name) < 2: p_name = lines[1] if len(lines) > 1 else p_name
+
+                    # 이미지 추출
                     img_urls = []
                     imgs = item.find_elements(By.TAG_NAME, "img")
                     for img in imgs:
@@ -103,13 +115,8 @@ if st.button("🚀 데이터 수집 시작"):
                     
                     if not img_urls: continue
 
-                    # 가격 추출 (보완된 로직 적용)
-                    reg_price, sale_price = extract_prices(item)
-                    product_name = item.text.split('\n')[0]
-
                     final_results.append({
-                        "제품명": product_name[:80],
-                        "정가": reg_price, "세일가": sale_price,
+                        "제품명": p_name[:80], "정가": reg_price, "세일가": sale_price,
                         "링크": link, "이미지들": img_urls
                     })
                     seen_links.add(link)
@@ -120,7 +127,7 @@ if st.button("🚀 데이터 수집 시작"):
                 ws = wb.active
                 ws.append(["번호", "제품명", "이미지1", "이미지2", "정가", "세일가", "상세링크"])
                 
-                # [수정] 엑셀 행/열 너비 최적화 (첨부파일 스타일 복구)
+                # 엑셀 스타일 및 너비 설정
                 ws.column_dimensions['B'].width = 40
                 ws.column_dimensions['C'].width = 30
                 ws.column_dimensions['D'].width = 30
@@ -129,14 +136,13 @@ if st.button("🚀 데이터 수집 시작"):
 
                 for i, data in enumerate(final_results, start=1):
                     row_idx = i + 1
-                    # [핵심] 이미지 크기에 맞는 넉넉한 행 높이 설정
-                    ws.row_dimensions[row_idx].height = 180 
+                    ws.row_dimensions[row_idx].height = 180 # 행 높이 보정
                     
                     ws.cell(row=row_idx, column=1, value=i).alignment = Alignment(horizontal='center', vertical='center')
                     ws.cell(row=row_idx, column=2, value=data["제품명"]).alignment = Alignment(wrap_text=True, vertical='center')
                     ws.cell(row=row_idx, column=5, value=data["정가"]).alignment = Alignment(horizontal='center', vertical='center')
                     
-                    # 세일가 강조 표시 복구
+                    # 세일가 강조 및 빨간색 처리
                     s_cell = ws.cell(row=row_idx, column=6, value=data["세일가"])
                     s_cell.alignment = Alignment(horizontal='center', vertical='center')
                     if data["세일가"] != "-":
@@ -148,15 +154,11 @@ if st.button("🚀 데이터 수집 시작"):
                         try:
                             res = requests.get(img_url, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
                             img_pil = PILImage.open(BytesIO(res.content)).convert("RGB")
-                            
-                            # 썸네일 생성 및 삽입
                             img_thumb = img_pil.copy()
-                            img_thumb.thumbnail((220, 220)) # 썸네일 크기 소폭 확대
+                            img_thumb.thumbnail((220, 220))
                             t_path = os.path.join(IMG_FOLDER, f"t_{row_idx}_{j}.png")
                             img_thumb.save(t_path)
                             ws.add_image(XLImage(t_path), f"{'C' if j==0 else 'D'}{row_idx}")
-                            
-                            # 고화질 원본 저장 (ZIP용)
                             img_pil.save(os.path.join(IMG_FOLDER, f"{i}_{j+1}.jpg"), "JPEG", quality=85)
                         except: continue
 
