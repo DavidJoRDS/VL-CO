@@ -40,21 +40,65 @@ target_url = st.text_input(
 )
 
 # ─────────────────────────────────────────
-# 유틸: 숫자 추출
+# 유틸: 가격 파싱
 # ─────────────────────────────────────────
-NUM_PATTERN = re.compile(r'[\$¥€£₩]?\s*[\d,]+(?:\.\d+)?')
+PRICE_MARKERS = ['원', '₩', 'KRW', '$', '¥', '€', '£']
 
-def extract_numbers(text: str) -> list:
-    results = []
-    for m in NUM_PATTERN.findall(text):
-        cleaned = re.sub(r'[^\d.]', '', m)
-        try:
-            val = float(cleaned)
-            if val >= 100:
-                results.append(val)
-        except ValueError:
+def parse_price_from_line(line: str) -> float:
+    """
+    한 줄 텍스트에서 가격 숫자 하나를 추출.
+    - '%' 앞 숫자(할인율) 제거: '20% 143,200원' → 143200
+    - '(숫자)' 리뷰수/괄호 제거: '(140)' → 제거
+    - 쉼표 있는 숫자 우선, 그 다음 5자리+, 그 다음 화폐기호+숫자
+    """
+    s = re.sub(r'\b\d{1,3}\s*%', '', line)        # 할인율 제거 (20%, 30% 등)
+    s = re.sub(r'\(\s*\d+\s*\)', '', s).strip()    # (140) 리뷰수 제거
+
+    # 쉼표 있는 숫자 (1,000 이상) — 가장 신뢰도 높음
+    m = re.search(r'\d{1,3}(?:,\d{3})+', s)
+    if m:
+        return float(re.sub(r'[^\d]', '', m.group()))
+
+    # 화폐기호 뒤 소수점 숫자 ($150.00 등)
+    m = re.search(r'[\$¥€£₩]\s*(\d+(?:\.\d+)?)', s)
+    if m:
+        return float(m.group(1))
+
+    # 5자리 이상 순수 숫자
+    m = re.search(r'\d{5,}', s)
+    if m:
+        return float(m.group())
+
+    return 0.0
+
+def get_price_vals(inner_text: str) -> list:
+    """
+    innerText 전체에서 가격 숫자 목록을 순서대로 반환 (중복 제거).
+    핵심 필터:
+      - 화폐 기호가 있거나, 쉼표숫자/5자리이상 숫자가 포함된 줄만 처리
+      - 할인율(20%)·별점(4.5)·리뷰수(140) 등 노이즈 숫자 자동 제거
+      - 최소값 1,000 이상만 가격으로 인정 (소수점 달러는 별도 처리)
+    """
+    lines = [l.strip() for l in inner_text.split('\n') if l.strip()]
+    seen = set()
+    result = []
+    for line in lines:
+        # 퍼센트·괄호 제거 후 가격 패턴 존재 여부 확인
+        no_noise = re.sub(r'\b\d{1,3}\s*%', '', line)
+        no_noise = re.sub(r'\(\s*\d+\s*\)', '', no_noise)
+        has_marker     = any(m in line for m in PRICE_MARKERS)
+        has_price_pat  = bool(re.search(
+            r'\d{1,3}(?:,\d{3})+|\d{5,}|[\$¥€£₩]\s*\d+', no_noise
+        ))
+        if not (has_marker or has_price_pat):
             continue
-    return results
+        val = parse_price_from_line(line)
+        # 최소 1,000 이상 (달러는 100 이상)
+        threshold = 100 if any(m in line for m in ['$', '¥', '€', '£']) else 1000
+        if val >= threshold and val not in seen:
+            seen.add(val)
+            result.append(val)
+    return result
 
 def fmt_price(val: float) -> str:
     if val == int(val):
@@ -62,7 +106,7 @@ def fmt_price(val: float) -> str:
     return f"{val:,.0f}"
 
 def fmt_sale_with_pct(sale_val: float, reg_val: float) -> str:
-    """세일가 문자열에 할인율 퍼센트 추가: '188,100 (20%)'"""
+    """'188,100 (20%)' 형식으로 세일가+할인율 반환"""
     sale_str = fmt_price(sale_val)
     if reg_val > 0 and 0 < sale_val < reg_val:
         pct = round((reg_val - sale_val) / reg_val * 100)
@@ -71,16 +115,24 @@ def fmt_sale_with_pct(sale_val: float, reg_val: float) -> str:
 
 
 # ─────────────────────────────────────────
-# 세일가 정밀 판별 (완전 재설계)
+# 세일가 정밀 판별
 #
-# [핵심 설계 원칙]
-# 단계별 신뢰도 순서로 탐색하되, 반드시 마지막 fallback까지 도달
-# → sale_kw만 발견되어도 4단계로 넘어감 (이전 버전 버그 수정)
+# [전략]
+# 1) strike/del/s 태그 또는 CSS line-through → 취소선 = 확실한 정가
+# 2) 클래스명 키워드 (정가+세일가 모두 발견 시만 반환)
+# 3) innerText 줄별 파싱 fallback
+#    → 가격 줄 1개: 정가만 / 2개: 큰값=정가·작은값=세일가
 # ─────────────────────────────────────────
 def get_refined_prices(driver, item_element, product_name=""):
     warn = ""
     try:
-        full_text = item_element.text.strip()
+        # innerText가 .text보다 headless에서 안정적
+        try:
+            full_text = driver.execute_script(
+                "return arguments[0].innerText;", item_element
+            ) or ""
+        except Exception:
+            full_text = item_element.text or ""
 
         # ── 1단계: 취소선 HTML 태그 ──────────────────────
         for sel in ["strike", "del", "s",
@@ -91,86 +143,75 @@ def get_refined_prices(driver, item_element, product_name=""):
                 continue
             tag = tags[0]
             reg_text = tag.text.strip()
-            # .text가 빈 경우 innerHTML에서 직접 숫자 추출 (CSS only 취소선 대응)
             if not reg_text:
                 try:
                     inner = driver.execute_script("return arguments[0].innerHTML;", tag)
                     reg_text = re.sub(r'<[^>]+>', '', inner).strip()
                 except Exception:
                     pass
-            reg_nums = extract_numbers(reg_text)
-            if not reg_nums:
+            reg_val = parse_price_from_line(reg_text)
+            if reg_val < 100:
                 continue
-            reg_val = reg_nums[0]
-            rest = full_text.replace(reg_text, "", 1)
-            sale_candidates = [v for v in extract_numbers(rest) if 0 < v < reg_val]
-            if sale_candidates:
-                sale_val = max(sale_candidates)
+            # 나머지 텍스트에서 정가보다 작은 가격 탐색
+            rest_vals = [v for v in get_price_vals(
+                full_text.replace(reg_text, "", 1)
+            ) if 0 < v < reg_val]
+            if rest_vals:
+                sale_val = max(rest_vals)
                 return fmt_price(reg_val), fmt_sale_with_pct(sale_val, reg_val), ""
-            # 취소선 있지만 세일가 후보 없음 → 4단계로 fallthrough
-            break
+            break  # 취소선 있지만 세일가 없음 → 다음 단계로
 
         # ── 2단계: JS computed style line-through ────────
-        child_tags = item_element.find_elements(By.CSS_SELECTOR, "span, p, em, strong, b")
-        for tag in child_tags[:20]:
+        for tag in item_element.find_elements(
+            By.CSS_SELECTOR, "span, p, em, strong, b"
+        )[:20]:
             try:
                 td = driver.execute_script(
                     "return window.getComputedStyle(arguments[0]).textDecoration;", tag
                 )
                 if not (td and "line-through" in td):
                     continue
-                reg_text = tag.text.strip()
-                reg_nums = extract_numbers(reg_text)
-                if not reg_nums:
+                reg_val = parse_price_from_line(tag.text.strip())
+                if reg_val < 100:
                     continue
-                reg_val = reg_nums[0]
-                rest = full_text.replace(reg_text, "", 1)
-                sale_candidates = [v for v in extract_numbers(rest) if 0 < v < reg_val]
-                if sale_candidates:
-                    sale_val = max(sale_candidates)
+                rest_vals = [v for v in get_price_vals(
+                    full_text.replace(tag.text.strip(), "", 1)
+                ) if 0 < v < reg_val]
+                if rest_vals:
+                    sale_val = max(rest_vals)
                     return fmt_price(reg_val), fmt_sale_with_pct(sale_val, reg_val), ""
-                break  # 취소선 있지만 세일가 없음 → 4단계로
+                break
             except Exception:
                 continue
 
         # ── 3단계: 클래스명 키워드 ───────────────────────
-        # 정가+세일가 모두 발견된 경우에만 반환
-        # sale_kw만 발견 → 반환하지 않고 4단계로 넘어감 (★핵심 수정)
         ORIGIN_KW = [
-            "consumer",        # 카페24 소비자가(정가)
-            "origin", "original", "origin-price", "originprice",
+            "consumer", "origin", "original", "origin-price", "originprice",
             "regular", "regular-price", "regularprice",
-            "old", "old-price", "oldprice",
-            "before", "before-price",
-            "crossed", "crossed-price",
-            "retail", "list-price", "listprice",
-            "was", "was-price", "msrp",
-            "compare", "compare-at",
-            "normal", "normal-price", "normalprice",
-            "price-origin",
+            "old", "old-price", "oldprice", "before", "before-price",
+            "crossed", "retail", "list-price", "listprice",
+            "was", "was-price", "msrp", "compare", "compare-at",
+            "normal", "normal-price", "normalprice", "price-origin",
         ]
         SALE_KW = [
-            "selling",         # 카페24 판매가
-            "sale-price", "saleprice", "price-sale",
-            "discount", "discounted",
-            "special", "special-price",
-            "final", "final-price",
-            "offer", "offer-price",
-            "promo", "promo-price",
-            "saving",
+            "selling", "sale-price", "saleprice", "price-sale",
+            "discount", "discounted", "special", "special-price",
+            "final", "final-price", "offer", "offer-price",
+            "promo", "promo-price", "saving",
         ]
-
         reg_val_kw = None
         sale_val_kw = None
-        for tag in item_element.find_elements(By.CSS_SELECTOR, "span, div, p, em, strong, b")[:40]:
+        for tag in item_element.find_elements(
+            By.CSS_SELECTOR, "span, div, p, em, strong, b"
+        )[:40]:
             try:
-                cls = (tag.get_attribute("class") or "").lower()
-                tid = (tag.get_attribute("id") or "").lower()
-                combined = cls + " " + tid
-                nums = extract_numbers(tag.text.strip())
-                if not nums:
+                combined = (
+                    (tag.get_attribute("class") or "") + " " +
+                    (tag.get_attribute("id") or "")
+                ).lower()
+                val = parse_price_from_line(tag.text.strip())
+                if val < 100:
                     continue
-                val = nums[0]
                 if reg_val_kw is None and any(kw in combined for kw in ORIGIN_KW):
                     reg_val_kw = val
                 elif sale_val_kw is None and any(kw in combined for kw in SALE_KW):
@@ -181,31 +222,22 @@ def get_refined_prices(driver, item_element, product_name=""):
         if reg_val_kw is not None and sale_val_kw is not None:
             return fmt_price(reg_val_kw), fmt_sale_with_pct(sale_val_kw, reg_val_kw), ""
         if reg_val_kw is not None:
-            # 정가 클래스만 발견 → 전체 텍스트에서 정가보다 작은 숫자 탐색
-            rest_candidates = [v for v in extract_numbers(full_text) if 0 < v < reg_val_kw]
-            if rest_candidates:
-                sale_val = max(rest_candidates)
-                return fmt_price(reg_val_kw), fmt_sale_with_pct(sale_val, reg_val_kw), ""
+            rest = [v for v in get_price_vals(full_text) if 0 < v < reg_val_kw]
+            if rest:
+                return fmt_price(reg_val_kw), fmt_sale_with_pct(max(rest), reg_val_kw), ""
             return fmt_price(reg_val_kw), "-", ""
-        # sale_kw만 발견되거나 아무것도 없으면 → 4단계로 계속
 
-        # ── 4단계: 전체 텍스트 숫자 fallback (가장 범용적) ──
-        # item.text에서 모든 가격 숫자를 추출해 크기 비교
-        # 숫자 2개 이상 → 큰값=정가, 작은값=세일가
-        # 숫자 1개 → 정가만 (세일 없음)
-        all_vals = extract_numbers(full_text)
-        seen_set = set()
-        unique_vals = []
-        for v in all_vals:
-            if v not in seen_set:
-                seen_set.add(v)
-                unique_vals.append(v)
+        # ── 4단계: innerText 줄별 파싱 fallback ──────────
+        # 핵심: 할인율(%)/리뷰수/(괄호숫자) 등 노이즈를 걷어낸 순수 가격 목록
+        price_vals = get_price_vals(full_text)
 
-        if len(unique_vals) >= 2:
-            sorted_vals = sorted(unique_vals, reverse=True)
-            return fmt_price(sorted_vals[0]), fmt_sale_with_pct(sorted_vals[1], sorted_vals[0]), ""
-        elif len(unique_vals) == 1:
-            return fmt_price(unique_vals[0]), "-", ""
+        if len(price_vals) >= 2:
+            sorted_vals = sorted(price_vals, reverse=True)
+            reg_val  = sorted_vals[0]
+            sale_val = sorted_vals[1]
+            return fmt_price(reg_val), fmt_sale_with_pct(sale_val, reg_val), ""
+        elif len(price_vals) == 1:
+            return fmt_price(price_vals[0]), "-", ""
 
     except Exception as e:
         warn = f"가격 추출 예외: {e}"
@@ -582,7 +614,7 @@ if start_btn:
         ws.column_dimensions['C'].width = 28
         ws.column_dimensions['D'].width = 28
         ws.column_dimensions['E'].width = 18
-        ws.column_dimensions['F'].width = 22
+        ws.column_dimensions['F'].width = 26   # 세일가+할인율 표시용
         ws.column_dimensions['G'].width = 14
 
         for i, data in enumerate(final_results, start=1):
@@ -595,7 +627,7 @@ if start_btn:
 
             # 세일가
             s_cell = ws.cell(row=row_idx, column=6)
-            s_cell.alignment = Alignment(horizontal='center', vertical='center')
+            s_cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
             if data["세일가"] != "-":
                 s_cell.value = data["세일가"]   # 예: '188,100 (20%)'
                 s_cell.font = Font(color="CC0000", bold=True, size=11)
