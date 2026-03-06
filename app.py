@@ -46,54 +46,66 @@ PRICE_MARKERS = ['원', '₩', 'KRW', '$', '¥', '€', '£']
 
 def parse_price_from_line(line: str) -> float:
     """
-    한 줄 텍스트에서 가격 숫자 하나를 추출.
-    - '%' 앞 숫자(할인율) 제거: '20% 143,200원' → 143200
-    - '(숫자)' 리뷰수/괄호 제거: '(140)' → 제거
-    - 쉼표 있는 숫자 우선, 그 다음 5자리+, 그 다음 화폐기호+숫자
+    한 줄에서 가격 숫자 하나를 추출.
+    - '20%' 같은 할인율 숫자를 먼저 제거
+    - '(140)' 같은 괄호 숫자(리뷰수) 제거
+    - 쉼표 숫자 → 소수점 달러 → 5자리+ 순으로 탐색
     """
-    s = re.sub(r'\b\d{1,3}\s*%', '', line)        # 할인율 제거 (20%, 30% 등)
-    s = re.sub(r'\(\s*\d+\s*\)', '', s).strip()    # (140) 리뷰수 제거
-
-    # 쉼표 있는 숫자 (1,000 이상) — 가장 신뢰도 높음
-    m = re.search(r'\d{1,3}(?:,\d{3})+', s)
+    s = re.sub(r'\b\d{1,3}\s*%', '', line)         # 할인율 제거
+    s = re.sub(r'\(\s*\d+\s*\)', '', s).strip()     # 리뷰수(괄호숫자) 제거
+    m = re.search(r'\d{1,3}(?:,\d{3})+', s)        # 쉼표 숫자 (1,000+)
     if m:
         return float(re.sub(r'[^\d]', '', m.group()))
-
-    # 화폐기호 뒤 소수점 숫자 ($150.00 등)
-    m = re.search(r'[\$¥€£₩]\s*(\d+(?:\.\d+)?)', s)
+    m = re.search(r'[\$¥€£₩]\s*(\d+(?:\.\d+)?)', s)  # 화폐기호+소수점
     if m:
         return float(m.group(1))
-
-    # 5자리 이상 순수 숫자
-    m = re.search(r'\d{5,}', s)
+    m = re.search(r'\d{5,}', s)                    # 5자리+ 순수 숫자
     if m:
         return float(m.group())
-
     return 0.0
+
+def extract_pct_from_text(text: str) -> int:
+    """
+    텍스트에서 할인율(%) 추출.
+    '20%', '20% OFF', '30% 할인' 형태 인식. 1~90 범위만 유효.
+    """
+    matches = re.findall(r'\b(\d{1,2})\s*%', text)
+    for m in matches:
+        pct = int(m)
+        if 1 <= pct <= 90:
+            return pct
+    return 0
+
+def calc_original_price(sale_val: float, pct: int) -> float:
+    """
+    세일가 + 할인율로 정가 역산.
+    100원 단위 반올림 후 검증 (오차 ±1.5% 이내면 신뢰).
+    """
+    if pct <= 0 or pct >= 100 or sale_val <= 0:
+        return 0.0
+    raw = sale_val / (1 - pct / 100)
+    rounded = round(raw / 100) * 100
+    check = (rounded - sale_val) / rounded * 100
+    return rounded if abs(check - pct) <= 1.5 else 0.0
 
 def get_price_vals(inner_text: str) -> list:
     """
-    innerText 전체에서 가격 숫자 목록을 순서대로 반환 (중복 제거).
-    핵심 필터:
-      - 화폐 기호가 있거나, 쉼표숫자/5자리이상 숫자가 포함된 줄만 처리
-      - 할인율(20%)·별점(4.5)·리뷰수(140) 등 노이즈 숫자 자동 제거
-      - 최소값 1,000 이상만 가격으로 인정 (소수점 달러는 별도 처리)
+    innerText에서 가격 숫자 목록을 순서대로 반환 (중복 제거).
+    할인율(%)/리뷰수/(괄호숫자)/별점 등 노이즈 제거 후 순수 가격만 추출.
     """
     lines = [l.strip() for l in inner_text.split('\n') if l.strip()]
     seen = set()
     result = []
     for line in lines:
-        # 퍼센트·괄호 제거 후 가격 패턴 존재 여부 확인
         no_noise = re.sub(r'\b\d{1,3}\s*%', '', line)
         no_noise = re.sub(r'\(\s*\d+\s*\)', '', no_noise)
-        has_marker     = any(m in line for m in PRICE_MARKERS)
-        has_price_pat  = bool(re.search(
+        has_marker    = any(m in line for m in PRICE_MARKERS)
+        has_price_pat = bool(re.search(
             r'\d{1,3}(?:,\d{3})+|\d{5,}|[\$¥€£₩]\s*\d+', no_noise
         ))
         if not (has_marker or has_price_pat):
             continue
         val = parse_price_from_line(line)
-        # 최소 1,000 이상 (달러는 100 이상)
         threshold = 100 if any(m in line for m in ['$', '¥', '€', '£']) else 1000
         if val >= threshold and val not in seen:
             seen.add(val)
@@ -106,7 +118,7 @@ def fmt_price(val: float) -> str:
     return f"{val:,.0f}"
 
 def fmt_sale_with_pct(sale_val: float, reg_val: float) -> str:
-    """'188,100 (20%)' 형식으로 세일가+할인율 반환"""
+    """'188,100 (20%)' 형식"""
     sale_str = fmt_price(sale_val)
     if reg_val > 0 and 0 < sale_val < reg_val:
         pct = round((reg_val - sale_val) / reg_val * 100)
@@ -117,16 +129,18 @@ def fmt_sale_with_pct(sale_val: float, reg_val: float) -> str:
 # ─────────────────────────────────────────
 # 세일가 정밀 판별
 #
-# [전략]
-# 1) strike/del/s 태그 또는 CSS line-through → 취소선 = 확실한 정가
-# 2) 클래스명 키워드 (정가+세일가 모두 발견 시만 반환)
-# 3) innerText 줄별 파싱 fallback
-#    → 가격 줄 1개: 정가만 / 2개: 큰값=정가·작은값=세일가
+# [전략 - 5단계]
+# 1) strike/del/s 태그 → 취소선 = 확실한 정가
+# 2) JS computed style line-through
+# 3) 클래스명 키워드 (정가+세일가 모두 발견 시만 반환)
+# 4) innerText 줄별 파싱 (노이즈 제거 후 가격 숫자 추출)
+# 5) [신규] 가격 1개만 있고 할인율(%)도 있으면 → 역산으로 정가 계산
+#    예) '20% 143,200원' → 정가=179,000 / 세일가=143,200 (20%)
 # ─────────────────────────────────────────
 def get_refined_prices(driver, item_element, product_name=""):
     warn = ""
     try:
-        # innerText가 .text보다 headless에서 안정적
+        # innerText가 headless에서 .text보다 안정적
         try:
             full_text = driver.execute_script(
                 "return arguments[0].innerText;", item_element
@@ -152,16 +166,15 @@ def get_refined_prices(driver, item_element, product_name=""):
             reg_val = parse_price_from_line(reg_text)
             if reg_val < 100:
                 continue
-            # 나머지 텍스트에서 정가보다 작은 가격 탐색
             rest_vals = [v for v in get_price_vals(
                 full_text.replace(reg_text, "", 1)
             ) if 0 < v < reg_val]
             if rest_vals:
                 sale_val = max(rest_vals)
                 return fmt_price(reg_val), fmt_sale_with_pct(sale_val, reg_val), ""
-            break  # 취소선 있지만 세일가 없음 → 다음 단계로
+            break  # 취소선 있지만 세일가 없음 → 다음 단계
 
-        # ── 2단계: JS computed style line-through ────────
+        # ── 2단계: CSS computed line-through ─────────────
         for tag in item_element.find_elements(
             By.CSS_SELECTOR, "span, p, em, strong, b"
         )[:20]:
@@ -227,17 +240,24 @@ def get_refined_prices(driver, item_element, product_name=""):
                 return fmt_price(reg_val_kw), fmt_sale_with_pct(max(rest), reg_val_kw), ""
             return fmt_price(reg_val_kw), "-", ""
 
-        # ── 4단계: innerText 줄별 파싱 fallback ──────────
-        # 핵심: 할인율(%)/리뷰수/(괄호숫자) 등 노이즈를 걷어낸 순수 가격 목록
+        # ── 4단계: innerText 줄별 파싱 ───────────────────
         price_vals = get_price_vals(full_text)
 
         if len(price_vals) >= 2:
-            sorted_vals = sorted(price_vals, reverse=True)
-            reg_val  = sorted_vals[0]
-            sale_val = sorted_vals[1]
-            return fmt_price(reg_val), fmt_sale_with_pct(sale_val, reg_val), ""
+            s = sorted(price_vals, reverse=True)
+            return fmt_price(s[0]), fmt_sale_with_pct(s[1], s[0]), ""
+
         elif len(price_vals) == 1:
-            return fmt_price(price_vals[0]), "-", ""
+            # ── 5단계: 가격 1개 + 할인율 → 역산으로 정가 계산 ──
+            # 예) '20% 143,200원 (140)' → 정가=179,000 / 세일가=143,200 (20%)
+            sale_val = price_vals[0]
+            pct = extract_pct_from_text(full_text)
+            if pct > 0:
+                orig = calc_original_price(sale_val, pct)
+                if orig > 0:
+                    return fmt_price(orig), fmt_sale_with_pct(sale_val, orig), ""
+            # 할인율 없음 → 단순 정가
+            return fmt_price(sale_val), "-", ""
 
     except Exception as e:
         warn = f"가격 추출 예외: {e}"
@@ -629,7 +649,7 @@ if start_btn:
             s_cell = ws.cell(row=row_idx, column=6)
             s_cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
             if data["세일가"] != "-":
-                s_cell.value = data["세일가"]   # 예: '188,100 (20%)'
+                s_cell.value = data["세일가"]   # 예: '143,200 (20%)'
                 s_cell.font = Font(color="CC0000", bold=True, size=11)
             else:
                 s_cell.value = "-"
